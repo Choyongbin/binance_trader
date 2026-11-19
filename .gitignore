@@ -1,0 +1,44 @@
+# NEVER commit credentials, runtime state, exports, or compiled binaries.
+/data/
+/bin/
+*.exe
+*.log
+*.test
+*.out
+.coverage*
+.DS_Store
+.vscode/
+.idea/
+.env
+.env.*
+*.enc
+
+
+@'
+# Credentials and secrets
+*.enc
+*.pem
+*.key
+.env
+.env.*
+vault/
+
+# Runtime and personal data
+data/
+pc-results/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Generated artifacts
+*.zip
+*.exe
+*.dll
+*.test
+*.tmp
+*.bak
+node_modules/
+dist/
+build/
+'@ | Add-Content -Path .gitignore -Encoding utf8

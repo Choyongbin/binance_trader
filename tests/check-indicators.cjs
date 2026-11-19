@@ -1,0 +1,36 @@
+// Optional JavaScript sanity test: node tests/check-indicators.cjs
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const source = fs.readFileSync('internal/server/web/app.js', 'utf8');
+const context = vm.createContext({ window:{addEventListener:()=>{}} });
+vm.runInContext(source,context);
+const run = code => vm.runInContext(code,context);
+assert.equal(run('MARKET_POLL_INTERVAL_MS'),250);
+assert.equal(source.includes("request('/api/v1/market/status')"),false);
+assert.equal(source.includes('setInterval(syncMarket,MARKET_POLL_INTERVAL_MS)'),true);
+assert.equal(source.includes('if(messageChanged){state.indicators=calculateIndicators(data.candles);renderMarket();}'),true);
+assert.equal(run('marketMessageChanged(null,{message_count:1})'),true);
+assert.equal(run('marketMessageChanged({message_count:7},{message_count:7})'),false);
+assert.equal(run('marketMessageChanged({message_count:7},{message_count:8})'),true);
+assert.deepEqual(Array.from(run('sma([1,2,3,4,5],3)')), [null,null,2,3,4]);
+assert.deepEqual(Array.from(run('ema([1,2,3,4,5],3)')), [null,null,2,3,4]);
+assert.equal(run('wilderRSI(Array.from({length:21},(_,i)=>i),14).at(-1)'),100);
+assert.equal(run('wilderRSI(Array.from({length:21},(_,i)=>-i),14).at(-1)'),0);
+assert.equal(run('wilderRSI(Array(21).fill(10),14).at(-1)'),50);
+assert.equal(run('calculateIndicators(Array.from({length:200},(_,i)=>({close:100+i}))).ema99.at(-1)')>0,true);
+assert.ok(Number.isFinite(run('calculateIndicators(Array.from({length:200},(_,i)=>({close:100+i}))).signal.at(-1)')));
+(async()=>{
+  let requested='';
+  context.fetch=async path=>{requested=path;return {status:503,ok:false,json:async()=>({ready:false,state:'connecting',message_count:0})};};
+  const unavailable=await run('requestMarketLive()');
+  assert.equal(requested,'/api/v1/market/live');
+  assert.equal(unavailable.ready,false);
+  assert.equal(unavailable.data.state,'connecting');
+  context.fetch=async path=>{requested=path;return {status:200,ok:true,json:async()=>({ready:true,message_count:7})};};
+  const available=await run('requestMarketLive()');
+  assert.equal(requested,'/api/v1/market/live');
+  assert.equal(available.ready,true);
+  assert.equal(available.data.message_count,7);
+  console.log('Indicator and market polling sanity checks: PASS');
+})().catch(error=>{console.error(error);process.exitCode=1;});

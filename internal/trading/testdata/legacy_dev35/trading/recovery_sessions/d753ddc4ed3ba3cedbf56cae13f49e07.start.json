@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "id": "d753ddc4ed3ba3cedbf56cae13f49e07",
+  "stage": "STARTED",
+  "started_at": "2026-09-29T14:15:24.719608947Z",
+  "finished_at": "0001-01-01T00:00:00Z",
+  "observer_connected": false,
+  "rest_reviewed": false,
+  "event_count": 0,
+  "discontinuity_count": 0,
+  "stale_after_observation": false,
+  "blockers": [],
+  "trading_authorized": false,
+  "manual_review_required": true,
+  "sha256": "c5d12b9ee1a5a647d4f4939a24e4badd2d556ae1b59b40a84f0da7bc163fcade"
+}

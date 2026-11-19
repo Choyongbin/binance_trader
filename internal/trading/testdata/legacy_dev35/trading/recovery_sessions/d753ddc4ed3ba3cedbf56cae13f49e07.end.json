@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "id": "d753ddc4ed3ba3cedbf56cae13f49e07",
+  "stage": "REVIEWED",
+  "started_at": "2026-09-29T14:15:24.719608947Z",
+  "finished_at": "2026-09-29T14:15:24.720804434Z",
+  "observer_connected": true,
+  "rest_reviewed": true,
+  "baseline_window_start_ms": 1790687724120,
+  "baseline_window_end_ms": 1790691324120,
+  "before_event_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "after_event_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "before_gap_digest": "9a6e3c012438fb4e931da1ccb002d8c4ce9c03174068f56ac0841f1d96ddc06c",
+  "after_gap_digest": "9a6e3c012438fb4e931da1ccb002d8c4ce9c03174068f56ac0841f1d96ddc06c",
+  "event_count": 0,
+  "discontinuity_count": 1,
+  "review_file": "review_20260929T141524_72dd874ccb4619761234cdf0bddc51b9.json",
+  "at_stop_event_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "at_stop_gap_digest": "9a7ac630ff5e01b78deb15bc0a8f567be982822d3cf29c1ee8ac63cacf8511b8",
+  "stale_after_observation": true,
+  "blockers": [
+    "계정 자산 위험: 자동매매 전용 배정 지갑과 실제 Demo 계정 일치 검증이 필요합니다",
+    "미해결 계정 스트림 불연속 마커 1건",
+    "연속 계정 이벤트/이력 보증용 승인 체크포인트 미구현: 거래 승인 불가",
+    "과거 진단 보고서이며 거래 허가가 아닙니다. 사설 스트림 중단 후 별도 재검증 필수",
+    "진단 이후 계정 이벤트 또는 종료 불연속: 기존 리뷰는 현재 상태 증명이 아님"
+  ],
+  "trading_authorized": false,
+  "manual_review_required": true,
+  "sha256": "a7dc60088c25e3486067ddf976f71b897a6ba6cf5382bbc6ed0dc13a111e8ded"
+}
