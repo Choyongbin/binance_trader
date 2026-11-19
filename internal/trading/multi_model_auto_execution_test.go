@@ -3,6 +3,7 @@ package trading
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -51,6 +52,33 @@ func twoModelAutoFixture(t *testing.T, firstAction, secondAction string) (*Multi
 		t.Fatal(err)
 	}
 	return rt, control, coordinator, exec, calls
+}
+
+func TestProductMultiModelConstructorBindsSignedEntryRecovery(t *testing.T) {
+	dir := t.TempDir()
+	control, err := OpenAutoRunControl(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := control.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := exchange.NewWithBase("http://127.0.0.1:1", &http.Client{Timeout: time.Millisecond})
+	creds := func(context.Context) (DemoCredentials, error) {
+		return DemoCredentials{APIKey: "fake", Secret: "fake"}, nil
+	}
+	market := func(context.Context) (exchange.LiveMarketSnapshot, error) { return exchange.LiveMarketSnapshot{}, nil }
+	runtime, err := NewDemoMultiModelAutoRuntimeWithRegistry(model.DefaultRegistry(), dir,
+		[]string{model.TestStrategyID, model.StrictStrategyID}, client, creds, market, control, lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	if len(runtime.paths) != 2 || runtime.paths[0].recoverEntry == nil || runtime.paths[1].recoverEntry == nil ||
+		runtime.paths[0].prepareProtection == nil || runtime.paths[1].prepareProtection == nil {
+		t.Fatal("product multi-model paths lack signed entry recovery or protection review")
+	}
 }
 
 func TestMultiModelRuntimeBothHoldNoReservations(t *testing.T) {

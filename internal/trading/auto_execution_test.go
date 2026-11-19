@@ -25,6 +25,17 @@ type autoPathExecutor struct {
 	final int
 }
 
+type autoLostAckExecutor struct{ calls int }
+
+func (*autoLostAckExecutor) durableFinalGuardContract() {}
+func (f *autoLostAckExecutor) SubmitWithFinalCheck(ctx context.Context, _ PlannedOrder, check func(context.Context) error) (Submission, error) {
+	if err := check(ctx); err != nil {
+		return Submission{}, err
+	}
+	f.calls++ // Fake exchange accepted the POST; its ACK is lost.
+	return Submission{}, errors.New("fake ACK lost after POST")
+}
+
 func (f *autoPathExecutor) durableFinalGuardContract() {}
 func (f *autoPathExecutor) SubmitWithFinalCheck(ctx context.Context, p PlannedOrder, check func(context.Context) error) (Submission, error) {
 	f.calls++
@@ -171,6 +182,174 @@ func TestAutoExecutionPathEnterLongConnectsSignalToDurableDispatch(t *testing.T)
 	}
 }
 
+func TestProductEntryRecoveryRunsAfterAcceptedOrUnknownSubmission(t *testing.T) {
+	for _, side := range []struct{ name, action string }{{"LONG", model.ActionEnterLong}, {"SHORT", model.ActionEnterShort}} {
+		for _, lost := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/lost=%t", side.name, lost), func(t *testing.T) {
+				candle := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC).UnixMilli()
+				p, _, _, exec, _ := autoPathFixture(t, model.Decision{ModelID: model.TestStrategyID, Status: model.StatusReady, Action: side.action, CandleOpenMS: candle})
+				if lost {
+					p.executor = &autoLostAckExecutor{}
+				}
+				recovered := 0
+				p.recoverEntry = func(_ context.Context, r Reservation) (ExecutionRecoveryResult, error) {
+					recovered++
+					life, err := p.lifecycle.Load(r)
+					if err != nil || life.Stage != ExecutionMayHaveSent {
+						t.Fatalf("signed recovery called before durable MAY_HAVE_SENT: %s %v", life.Stage, err)
+					}
+					return ExecutionRecoveryResult{ClientOrderID: r.ClientOrderID, FinalStage: ExecutionMayHaveSent, TradingAuthorized: false}, nil
+				}
+				rt := &AutoExecutionRuntime{Path: p}
+				result, err := rt.RunOnce(context.Background())
+				if recovered != 1 || result.ClientOrderID == "" || result.Lifecycle != ExecutionMayHaveSent {
+					t.Fatalf("entry recovery not linked: %+v calls=%d err=%v", result, recovered, err)
+				}
+				if lost {
+					if err == nil || !strings.Contains(err.Error(), "ACK") || p.executor.(*autoLostAckExecutor).calls != 1 {
+						t.Fatalf("ACK loss was replayed or hidden: %v", err)
+					}
+				} else if !errors.Is(err, ErrSupervisedSingleOrderComplete) || exec.calls != 1 {
+					t.Fatalf("accepted order did not stop for signed review: %v calls=%d", err, exec.calls)
+				}
+			})
+		}
+	}
+}
+
+func TestProductPathPreparesProtectionOnlyAfterSignedFilledRecovery(t *testing.T) {
+	for _, action := range []string{model.ActionEnterLong, model.ActionEnterShort} {
+		for _, lost := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/lost=%t", action, lost), func(t *testing.T) {
+				candle := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC).UnixMilli()
+				p, _, _, exec, _ := autoPathFixture(t, model.Decision{ModelID: model.TestStrategyID, Status: model.StatusReady, Action: action, CandleOpenMS: candle})
+				if lost {
+					p.executor = &autoLostAckExecutor{}
+				}
+				prepared := 0
+				p.recoverEntry = func(_ context.Context, r Reservation) (ExecutionRecoveryResult, error) {
+					life, err := p.lifecycle.Load(r)
+					if err != nil || life.Stage != ExecutionMayHaveSent {
+						t.Fatalf("recovery before durable dispatch: %s %v", life.Stage, err)
+					}
+					return ExecutionRecoveryResult{FinalStage: ExecutionFillsImported}, nil
+				}
+				p.prepareProtection = func(_ context.Context, r Reservation) (RecoveredEntryProtectionReview, error) {
+					if r.ClientOrderID == "" {
+						t.Fatal("missing durable order identity")
+					}
+					prepared++
+					return RecoveredEntryProtectionReview{State: EntryProtectionPreparedReview}, nil
+				}
+				result, err := (&AutoExecutionRuntime{Path: p}).RunOnce(context.Background())
+				if !errors.Is(err, ErrProtectionApproval) || result.ProtectionState != EntryProtectionPreparedReview ||
+					result.Lifecycle != ExecutionFillsImported || !result.Dispatched || prepared != 1 {
+					t.Fatalf("unsupervised protection advanced: result=%+v err=%v prepared=%d", result, err, prepared)
+				}
+				if lost {
+					if !strings.Contains(err.Error(), "ACK") || p.executor.(*autoLostAckExecutor).calls != 1 {
+						t.Fatalf("ACK loss hidden or entry replayed: %v", err)
+					}
+				} else if exec.calls != 1 {
+					t.Fatalf("entry send count=%d", exec.calls)
+				}
+			})
+		}
+	}
+}
+
+func TestProductRecoveryContextSurvivesRequestCancellationButIsBounded(t *testing.T) {
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	hook := productSignedEntryRecovery(nil, nil, nil, nil, func(ctx context.Context) (DemoCredentials, error) {
+		called = true
+		if ctx.Err() != nil {
+			t.Fatal("expired order context reused for signed recovery")
+		}
+		if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > 12*time.Second || time.Until(deadline) <= 0 {
+			t.Fatal("signed recovery has no bounded independent deadline")
+		}
+		return DemoCredentials{}, errors.New("fake credentials unavailable")
+	})
+	if _, err := hook(requestCtx, Reservation{}); !called || err == nil {
+		t.Fatalf("bounded recovery was not attempted: called=%t err=%v", called, err)
+	}
+}
+
+func TestProductProtectionPlannerRejectsMissingSignedPositionWithoutMutation(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet {
+			t.Fatalf("unexpected exchange mutation: %s %s", r.Method, r.URL.Path)
+		}
+		switch r.URL.Path {
+		case "/fapi/v1/time":
+			fmt.Fprintf(w, `{"serverTime":%d}`, time.Now().UnixMilli())
+		case "/fapi/v3/balance":
+			w.Write([]byte(`[{"asset":"USDT","balance":"1000","availableBalance":"1000"}]`))
+		case "/fapi/v3/positionRisk", "/fapi/v1/openOrders", "/fapi/v1/openAlgoOrders":
+			w.Write([]byte(`[]`))
+		default:
+			t.Fatalf("unexpected exchange path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	client := exchange.NewWithBase(srv.URL, srv.Client())
+	market := func(context.Context) (exchange.LiveMarketSnapshot, error) {
+		return exchange.LiveMarketSnapshot{
+			MarketSnapshot:   exchange.MarketSnapshot{Symbol: "BTCUSDT", Candles: []exchange.Candle{{Close: 100000}}},
+			LiveMarketStatus: exchange.LiveMarketStatus{LastReceivedAt: time.Now().UTC().Format(time.RFC3339Nano)},
+		}, nil
+	}
+	planner := productProtectionPlanner(t.TempDir(), nil, nil, nil, client,
+		func(context.Context) (DemoCredentials, error) {
+			return DemoCredentials{APIKey: "fake", Secret: "fake"}, nil
+		}, market)
+	_, err := planner(context.Background(), Reservation{Intent: Intent{Symbol: "BTCUSDT", PositionSide: Long}})
+	if err == nil || !strings.Contains(err.Error(), "signed owned position is absent") || requests != 5 {
+		t.Fatalf("missing signed position was not blocked: err=%v requests=%d", err, requests)
+	}
+}
+
+func TestProductRuntimeLostAckImportsSignedEntryWithoutReplay(t *testing.T) {
+	for _, action := range []string{model.ActionEnterLong, model.ActionEnterShort} {
+		t.Run(action, func(t *testing.T) {
+			candle := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC).UnixMilli()
+			p, dir, coordinator, _, _ := autoPathFixture(t, model.Decision{ModelID: model.TestStrategyID, Status: model.StatusReady, Action: action, CandleOpenMS: candle})
+			lost := &autoLostAckExecutor{}
+			p.executor = lost
+			var reservation Reservation
+			p.recoverEntry = func(ctx context.Context, r Reservation) (ExecutionRecoveryResult, error) {
+				reservation = r
+				rec, order := finalOrderForReservation(t, dir, r, 8801, "FILLED", r.Intent.Quantity)
+				reader := &readerOrders{
+					orders: map[string]exchange.OrderResult{r.ClientOrderID: order},
+					trades: map[int64][]exchange.AccountTrade{8801: {
+						receipt(rec, 880101, r.Intent.Quantity, "100000", "0.1", "0", time.Now().UTC().UnixMilli()),
+					}},
+				}
+				return productSignedEntryRecovery(coordinator, p.lifecycle, p.ownership, reader,
+					func(context.Context) (DemoCredentials, error) {
+						return DemoCredentials{APIKey: "fake", Secret: "fake"}, nil
+					})(ctx, r)
+			}
+			result, err := (&AutoExecutionRuntime{Path: p}).RunOnce(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "ACK") || lost.calls != 1 || result.Lifecycle != ExecutionFillsImported {
+				t.Fatalf("lost ACK recovery: result=%+v err=%v submits=%d", result, err, lost.calls)
+			}
+			fills, err := p.ownership.readFills()
+			if err != nil || len(fills) != 1 || fills[0].ClientOrderID != reservation.ClientOrderID {
+				t.Fatalf("signed fill not imported exactly once: %+v %v", fills, err)
+			}
+			if _, err := p.RunOnce(context.Background()); err == nil || lost.calls != 1 {
+				t.Fatalf("restart attempted duplicate entry: err=%v sends=%d", err, lost.calls)
+			}
+		})
+	}
+}
+
 func TestAutoExecutionPathReadinessFailureBeforeReservation(t *testing.T) {
 	candle := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC).UnixMilli()
 	d := model.Decision{ModelID: model.TestStrategyID, Status: model.StatusReady, Action: model.ActionEnterLong, CandleOpenMS: candle, LongEntry: true}
@@ -303,6 +482,9 @@ func TestDemoAutoExecutionRuntimeCompositionKeepsServerUnlockSeparate(t *testing
 	}
 	if rt.Path == nil || rt.coordinator == nil {
 		t.Fatal("runtime composition missing")
+	}
+	if rt.Path.recoverEntry == nil || rt.Path.prepareProtection == nil {
+		t.Fatal("product runtime lacks signed entry recovery or protection review")
 	}
 	if err := rt.Close(); err != nil {
 		t.Fatal(err)

@@ -36,21 +36,22 @@ type AutoDecisionEvaluator func(exchange.LiveMarketSnapshot, model.OwnerState, t
 
 // AutoExecutionResult describes a single model evaluation. HOLD produces no
 // reservation. A dispatched result means the internal order adapter was called;
-// no server/HTTP route instantiates this path while trading remains LOCKED.
+// the server constructs this path behind the HTTP 423 trading lock.
 type AutoExecutionResult struct {
-	ModelID       string                 `json:"model_id"`
-	Decision      model.Decision         `json:"decision"`
-	Intent        Intent                 `json:"intent,omitempty"`
-	ClientOrderID string                 `json:"client_order_id,omitempty"`
-	Lifecycle     ExecutionStage         `json:"lifecycle_stage,omitempty"`
-	Submission    Submission             `json:"submission,omitempty"`
-	Dispatched    bool                   `json:"dispatched"`
-	Evaluations   []MultiModelEvaluation `json:"model_evaluations,omitempty"`
+	ModelID         string                 `json:"model_id"`
+	Decision        model.Decision         `json:"decision"`
+	Intent          Intent                 `json:"intent,omitempty"`
+	ClientOrderID   string                 `json:"client_order_id,omitempty"`
+	Lifecycle       ExecutionStage         `json:"lifecycle_stage,omitempty"`
+	ProtectionState string                 `json:"protection_state,omitempty"`
+	Submission      Submission             `json:"submission,omitempty"`
+	Dispatched      bool                   `json:"dispatched"`
+	Evaluations     []MultiModelEvaluation `json:"model_evaluations,omitempty"`
 }
 
-// AutoExecutionPath is the only internal model->order connection. The web
-// server does not construct it yet. When Demo unlock is later approved, the
-// controller must be long-lived so Coordinator ownership spans the full run.
+// AutoExecutionPath is the internal model->order connection. The server owns
+// the runtime factory, but the HTTP route remains locked. Its controller must
+// remain long-lived so Coordinator ownership spans the full run.
 type AutoExecutionPath struct {
 	modelID     string
 	coordinator *Coordinator
@@ -65,6 +66,10 @@ type AutoExecutionPath struct {
 	now         func() time.Time
 	control     *AutoRunControl
 	lease       AutoRunLease
+	// Product constructors bind signed, entry-only recovery. Test paths may
+	// leave it nil; no callback can authorize another POST or settlement.
+	recoverEntry      func(context.Context, Reservation) (ExecutionRecoveryResult, error)
+	prepareProtection func(context.Context, Reservation) (RecoveredEntryProtectionReview, error)
 }
 
 func NewAutoExecutionPath(modelID string, coordinator *Coordinator, ownership *OwnershipStore, budget *walletpkg.Store,
@@ -374,11 +379,43 @@ func (p *AutoExecutionPath) RunOnce(ctx context.Context) (AutoExecutionResult, e
 	result.Lifecycle = life.Stage
 	ack, err := p.lifecycle.DispatchOnce(ctx, reservation, p.executor, p.executionGuard)
 	result.Submission = ack
+	// Once MAY_HAVE_SENT is durable, an ACK (including an error or lost ACK)
+	// cannot decide whether the exchange has an order. A fresh, bounded signed
+	// GET imports only actual entry fills; it never settles or resubmits.
+	if p.recoverEntry != nil && intent.Action == Enter {
+		current, loadErr := p.lifecycle.Load(reservation)
+		if loadErr != nil {
+			return result, fmt.Errorf("주문 이후 lifecycle 확인 실패; 재전송 금지: %w", loadErr)
+		}
+		if current.Stage != ExecutionReserved {
+			recovered, recoverErr := p.recoverEntry(ctx, reservation)
+			if recovered.FinalStage != "" {
+				result.Lifecycle = recovered.FinalStage
+			}
+			if recovered.FinalStage == ExecutionFillsImported {
+				result.Dispatched = true
+			}
+			if recoverErr == nil && recovered.FinalStage == ExecutionFillsImported && p.prepareProtection != nil {
+				review, reviewErr := p.prepareProtection(ctx, reservation)
+				result.ProtectionState = review.State
+				if reviewErr != nil {
+					return result, errors.Join(err, fmt.Errorf("protection plan review failed; new entry blocked: %w", reviewErr))
+				}
+				// A local plan is not an armed TP/SL pair.
+				return result, errors.Join(err, ErrProtectionApproval)
+			}
+			if recoverErr != nil {
+				return result, errors.Join(err, fmt.Errorf("주문 이후 signed 진입 복구 불확실; 재전송 금지: %w", recoverErr))
+			}
+		}
+	}
 	if err != nil {
 		return result, err
 	}
 	result.Dispatched = true
-	result.Lifecycle = ExecutionMayHaveSent
+	if result.Lifecycle == ExecutionReserved {
+		result.Lifecycle = ExecutionMayHaveSent
+	}
 	return result, nil
 }
 
@@ -618,7 +655,29 @@ func (r *AutoExecutionRuntime) RunOnce(ctx context.Context) (AutoExecutionResult
 	if r == nil || r.Path == nil {
 		return AutoExecutionResult{}, errors.New("자동매매 runtime이 초기화되지 않았습니다")
 	}
-	return r.Path.RunOnce(ctx)
+	result, err := r.Path.RunOnce(ctx)
+	if err == nil && result.Dispatched && result.ClientOrderID != "" {
+		// No unattended second order while protection and full settlement are
+		// still under independent signed review.
+		return result, ErrSupervisedSingleOrderComplete
+	}
+	return result, err
+}
+
+func productSignedEntryRecovery(coordinator *Coordinator, lifecycle *ExecutionLifecycleStore,
+	ownership *OwnershipStore, reader DemoTradeReader, credentials CredentialsProvider,
+) func(context.Context, Reservation) (ExecutionRecoveryResult, error) {
+	return func(requestCtx context.Context, reservation Reservation) (ExecutionRecoveryResult, error) {
+		// The order request may have timed out after its POST. STOP cancels new
+		// entries, but must not cancel this bounded GET-only evidence recovery.
+		recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(requestCtx), 12*time.Second)
+		defer cancel()
+		creds, err := credentials(recoveryCtx)
+		if err != nil {
+			return ExecutionRecoveryResult{ClientOrderID: reservation.ClientOrderID, TradingAuthorized: false}, err
+		}
+		return lifecycle.RecoverOwnedEntryFillsOnly(recoveryCtx, reservation, coordinator, ownership, reader, creds)
+	}
 }
 
 func (r *AutoExecutionRuntime) Close() error {
@@ -811,8 +870,8 @@ func NewAutoSignedTradingReadinessGuardForModel(modelID, dataDir string, coordin
 
 // NewDemoAutoExecutionRuntime composes the entire internal automatic path:
 // model signal -> signed evidence -> wallet-aware reservation -> lifecycle ->
-// execution-scoped signed readiness -> DemoExecutor. The server deliberately
-// does not call this constructor while /trading/auto/start remains HTTP 423.
+// execution-scoped signed readiness -> DemoExecutor. The server binds its
+// factory, while /trading/auto/start remains HTTP 423.
 func NewDemoAutoExecutionRuntime(dataDir, modelID string, client *exchange.Client, credentials CredentialsProvider,
 	market AutoMarketProvider, control *AutoRunControl, lease AutoRunLease) (*AutoExecutionRuntime, error) {
 	return NewDemoAutoExecutionRuntimeWithRegistry(model.DefaultRegistry(), dataDir, modelID, client, credentials, market, control, lease)
@@ -880,5 +939,7 @@ func NewDemoAutoExecutionRuntimeWithRegistry(registry *model.Registry, dataDir, 
 	if err := path.bindRunControl(control, lease); err != nil {
 		return fail(err)
 	}
+	path.recoverEntry = productSignedEntryRecovery(coordinator, lifecycle, ownership, client, credentials)
+	path.prepareProtection = productProtectionPlanner(dataDir, coordinator, lifecycle, ownership, client, credentials, market)
 	return &AutoExecutionRuntime{Path: path, coordinator: coordinator}, nil
 }

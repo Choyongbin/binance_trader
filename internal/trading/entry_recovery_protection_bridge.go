@@ -6,7 +6,7 @@ package trading
 // The only mutations made here are local, append-only signed-fill recovery and
 // a deterministic, non-executable protection plan. This function NEVER
 // submits/cancels a Binance order, creates a trading authorization, or settles
-// an execution. The HTTP controller and unattended auto runtime do not call it.
+// an execution. The locked product runtime may call it for a local plan only.
 import (
 	"context"
 	"errors"
@@ -63,8 +63,8 @@ func entryProtectionGroupID(r Reservation) string {
 //  4. Deterministic TP/SL preview and idempotent local plan preparation.
 //  5. Independent signed account read-back and continuity inspection.
 //
-// This is NOT called by RunOnce, a scheduler, or the HTTP server. A different,
-// explicitly supervised function exists for eventually sending TP/SL, and
+// RunOnce may call this through its product planner after signed fill recovery.
+// A different, explicitly supervised function exists for sending TP/SL, and
 // its separate operator authorization/incident recovery is still required.
 // Passing a reader and transport does NOT allow this function to send orders.
 func RecoverAndPrepareEntryProtectionSupervised(ctx context.Context,

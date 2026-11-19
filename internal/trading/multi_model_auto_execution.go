@@ -125,8 +125,7 @@ func (r *MultiModelAutoRuntime) Close() error {
 
 // NewDemoMultiModelAutoRuntimeWithRegistry composes selected frozen model
 // strategies onto one shared Demo account and one durable coordinator lock.
-// This constructor is never reachable from the production web server until
-// an explicitly reviewed E2E activation path is introduced.
+// The server owns this constructor behind its HTTP 423 trading lock.
 func NewDemoMultiModelAutoRuntimeWithRegistry(registry *model.Registry, dataDir string, ids []string, client *exchange.Client,
 	credentials CredentialsProvider, market AutoMarketProvider, control *AutoRunControl, lease AutoRunLease) (*MultiModelAutoRuntime, error) {
 	if registry == nil || dataDir == "" || client == nil || credentials == nil || market == nil || control == nil {
@@ -204,6 +203,8 @@ func NewDemoMultiModelAutoRuntimeWithRegistry(registry *model.Registry, dataDir 
 		if err := path.bindRunControl(control, lease); err != nil {
 			return fail(err)
 		}
+		path.recoverEntry = productSignedEntryRecovery(coordinator, lifecycle, ownership, client, credentials)
+		path.prepareProtection = productProtectionPlanner(dataDir, coordinator, lifecycle, ownership, client, credentials, market)
 		paths = append(paths, path)
 	}
 	runtime, err := newMultiModelAutoRuntime(paths, control, lease, coordinator.Close)
