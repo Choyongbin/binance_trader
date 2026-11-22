@@ -61,6 +61,7 @@ type Server struct {
 	readinessCapability       func() (known bool, canTrade bool)
 	autoControl               *trading.AutoRunControl
 	autoController            *trading.AutoController
+	protectionWatcher         *trading.ProductProtectionPoller
 	strategyRegistry          *model.Registry
 	modelObserver             *modelSignalObserver
 	modelSignalMarketProvider func() (exchange.LiveMarketSnapshot, error)
@@ -133,6 +134,21 @@ func newWithFetcher(dataDir string, fetcher exchange.Fetcher) (*Server, error) {
 		srv.demo.Close()
 		return nil, fmt.Errorf("자동매매 controller 구성 오류: %w", err)
 	}
+	// Process-lifetime, GET-only protection observation. The watcher is
+	// independent of the auto-run lease, so STOP does not stop inspecting
+	// existing exposure. It never authorizes a Binance POST or DELETE.
+	srv.protectionWatcher, err = trading.NewProductProtectionPoller(func(ctx context.Context) (trading.PendingProtectionInventory, error) {
+		if srv.store.Snapshot().Environment != app.Demo || srv.accountDiagnosticBusy.Load() ||
+			srv.recoveryBusy.Load() || srv.autoController.Status().Running {
+			return trading.PendingProtectionInventory{State: trading.PendingProtectionInspectionBlocked, ManualReviewRequired: true},
+				errors.New("protection inspection deferred: environment or exclusive operation")
+		}
+		return trading.InspectDemoOutstandingProtectionsOnce(ctx, dataDir, autoClient, credentialsProvider)
+	}, 90*time.Second, 15*time.Second)
+	if err != nil {
+		srv.demo.Close()
+		return nil, fmt.Errorf("protection read-only watch configuration: %w", err)
+	}
 	srv.accountingReader = exchange.NewDemoClient()
 	srv.recoveryRunner = func(ctx context.Context, creds trading.DemoCredentials, dir string, since int64) (trading.RecoveryProbe, error) {
 		return trading.ProbeLiveDemoRecovery(ctx, exchange.NewDemoClient(), creds, dir, since, nil)
@@ -167,8 +183,14 @@ func newWithFetcher(dataDir string, fetcher exchange.Fetcher) (*Server, error) {
 func (s *Server) StartMarket() {
 	s.live.Start()
 	s.modelObserver.Start(s.sampleModelSignals)
+	if s.protectionWatcher != nil {
+		_ = s.protectionWatcher.Start()
+	}
 }
 func (s *Server) Close() {
+	if s.protectionWatcher != nil {
+		_ = s.protectionWatcher.Close()
+	}
 	if s.modelObserver != nil {
 		s.modelObserver.Close()
 	}
@@ -199,6 +221,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/trading/readiness", s.tradingReadiness)
 	mux.HandleFunc("POST /api/v1/trading/execution-preflight", s.mutation(s.executionPreflightDiagnostic))
 	mux.HandleFunc("GET /api/v1/trading/auto/status", s.autoControlStatus)
+	mux.HandleFunc("GET /api/v1/trading/protection/watch-status", s.protectionWatchStatus)
 	mux.HandleFunc("POST /api/v1/wallet/auto/change", s.mutation(s.changeAutoWallet))
 	mux.HandleFunc("GET /api/v1/trading/config", s.tradingConfig)
 	mux.HandleFunc("POST /api/v1/trading/config/apply-demo-v1", s.mutation(s.applyDemoTradingConfig))

@@ -30,6 +30,7 @@ type MultiModelAutoRuntime struct {
 	control     *AutoRunControl
 	lease       AutoRunLease
 	closeShared func() error
+	protection  *DemoProtectionRuntimeCoordinator
 	terminal    bool
 	closed      bool
 }
@@ -188,6 +189,9 @@ func NewDemoMultiModelAutoRuntimeWithRegistry(registry *model.Registry, dataDir 
 		if err != nil {
 			return fail(err)
 		}
+		// Each product strategy shares the same immutable safety boundary.
+		// Internal test-only paths may use injected mock guards separately.
+		guard = requireProductProtectionDispatchApproval(guard)
 		gate, err := NewModelDemoLiveGateForModel(id, client, coordinator, budget)
 		if err != nil {
 			return fail(err)
@@ -211,6 +215,11 @@ func NewDemoMultiModelAutoRuntimeWithRegistry(registry *model.Registry, dataDir 
 	if err != nil {
 		return fail(err)
 	}
+	protection, err := NewDemoProtectionRuntimeCoordinator(dataDir, coordinator, client, credentials)
+	if err != nil {
+		return fail(err)
+	}
+	runtime.protection = protection
 	return runtime, nil
 }
 

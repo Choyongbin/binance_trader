@@ -649,6 +649,7 @@ func NewModelDemoLiveGateForModel(modelID string, client *exchange.Client, coord
 type AutoExecutionRuntime struct {
 	Path        *AutoExecutionPath
 	coordinator *Coordinator
+	protection  *DemoProtectionRuntimeCoordinator
 }
 
 func (r *AutoExecutionRuntime) RunOnce(ctx context.Context) (AutoExecutionResult, error) {
@@ -914,6 +915,10 @@ func NewDemoAutoExecutionRuntimeWithRegistry(registry *model.Registry, dataDir, 
 	if err != nil {
 		return fail(err)
 	}
+	// Even if the HTTP 423 lock is accidentally removed, the product runtime
+	// must not submit a naked entry or an unmanaged exit. A local TP/SL
+	// preview is not independent approval to mutate Binance orders.
+	guard = requireProductProtectionDispatchApproval(guard)
 	gate, err := NewModelDemoLiveGateForModel(modelID, client, coordinator, budget)
 	if err != nil {
 		return fail(err)
@@ -941,5 +946,9 @@ func NewDemoAutoExecutionRuntimeWithRegistry(registry *model.Registry, dataDir, 
 	}
 	path.recoverEntry = productSignedEntryRecovery(coordinator, lifecycle, ownership, client, credentials)
 	path.prepareProtection = productProtectionPlanner(dataDir, coordinator, lifecycle, ownership, client, credentials, market)
-	return &AutoExecutionRuntime{Path: path, coordinator: coordinator}, nil
+	protection, err := NewDemoProtectionRuntimeCoordinator(dataDir, coordinator, client, credentials)
+	if err != nil {
+		return fail(err)
+	}
+	return &AutoExecutionRuntime{Path: path, coordinator: coordinator, protection: protection}, nil
 }

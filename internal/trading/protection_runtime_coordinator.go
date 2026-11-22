@@ -13,6 +13,8 @@ type DemoProtectionRuntimeCoordinator struct {
 	coordinator *Coordinator
 	submissions *ProtectionSubmissionStore
 	settlements *ProtectionSettlementStore
+	lifecycle   *ExecutionLifecycleStore
+	reader      EntryProtectionLifecycleSignedReader
 	owners      *OwnershipStore
 	cancels     *CancelIntentStore
 	client      *exchange.Client
@@ -34,6 +36,10 @@ func NewDemoProtectionRuntimeCoordinator(dataDir string, coordinator *Coordinato
 	if err != nil {
 		return nil, err
 	}
+	lifecycle, err := NewExecutionLifecycleStore(dataDir)
+	if err != nil {
+		return nil, err
+	}
 	owners, err := NewOwnershipStore(dataDir)
 	if err != nil {
 		return nil, err
@@ -42,7 +48,45 @@ func NewDemoProtectionRuntimeCoordinator(dataDir string, coordinator *Coordinato
 	if err != nil {
 		return nil, err
 	}
-	return &DemoProtectionRuntimeCoordinator{dataDir: dataDir, coordinator: coordinator, submissions: submissions, settlements: settlements, owners: owners, cancels: cancels, client: client, credentials: credentials}, nil
+	return &DemoProtectionRuntimeCoordinator{dataDir: dataDir, coordinator: coordinator, submissions: submissions, settlements: settlements, lifecycle: lifecycle, reader: client, owners: owners, cancels: cancels, client: client, credentials: credentials}, nil
+}
+
+// InspectEntryProtection performs an operator-facing, signed GET-only review of
+// a durable entry and its protection legs. It deliberately has no dependency on
+// the auto-run lease: STOP must not make existing positions invisible to an
+// operator. The inspection never POSTs/DELETEs, changes a checkpoint, grants
+// trading approval, or financially settles a fill. In particular, an ACTIVE
+// pair is *not* atomic OCO and still requires independent supervision.
+//
+// A missing or corrupt entry, ambiguous ACK, account drift, or stale signed
+// evidence is fail-closed. This is not an unattended protection supervisor;
+// do not call it a proof of continuous protection.
+func (r *DemoProtectionRuntimeCoordinator) InspectEntryProtection(ctx context.Context, entry Reservation) (EntryProtectionLifecycleReview, error) {
+	blocked := EntryProtectionLifecycleReview{
+		State:                EntryLifecycleBlocked,
+		ClientOrderID:        entry.ClientOrderID,
+		ManualReviewRequired: true,
+		Reason:               "제품 보호주문 signed inspector를 사용할 수 없습니다",
+	}
+	if r == nil || ctx == nil || r.coordinator == nil || r.lifecycle == nil ||
+		r.submissions == nil || r.cancels == nil || r.reader == nil || r.credentials == nil {
+		return blocked, errors.New("제품 protection signed inspector 구성요소 누락")
+	}
+	if err := ctx.Err(); err != nil {
+		return blocked, err
+	}
+	if err := r.coordinator.ownsLock(); err != nil {
+		return blocked, err
+	}
+	creds, err := r.credentials(ctx)
+	if err != nil {
+		return blocked, err
+	}
+	// The shared read-only reviewer independently validates sealed entry,
+	// plan, checkpoints, signed account snapshots, identity and exit fills.
+	// A caller-supplied Reservation never grants an exchange mutation.
+	return ReviewRecoveredEntryProtectionLifecycleSigned(ctx, entry,
+		r.coordinator, r.lifecycle, r.submissions, r.cancels, r.reader, creds)
 }
 
 // Arm is fail-closed until the product has independent approval, full signed

@@ -383,7 +383,10 @@ func TestLegacyDev355SignedInspectorExactKnownBytesAccepted(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		historical := bytes.ReplaceAll(current, []byte("v0.4.11-dev.3.56"), []byte("v0.4.11-dev.3.55"))
+		// Git stores this fixture with LF, while Windows core.autocrlf may
+		// check it out with CRLF. Reconstruct the historical committed bytes.
+		canonical := bytes.ReplaceAll(current, []byte("\r\n"), []byte("\n"))
+		historical := bytes.ReplaceAll(canonical, []byte("v0.4.11-dev.3.56"), []byte("v0.4.11-dev.3.55"))
 		sum := sha256.Sum256(historical)
 		if hex.EncodeToString(sum[:]) != expected {
 			t.Fatalf("legacy inspector source changed unexpectedly: %s", rel)
